@@ -1,10 +1,12 @@
 // tmse.js (module): Core engine, router, discovery, saves, RNG, star calc, flows.
-// Provides TMSE namespace on window and as a module export.
+// PATCH: lesson-best definition, debounced lesson list rendering, import timeout & safe modal,
+// event delegation for reliable in-game taps, duplicate lesson guard, namespaced logs.
 
 import { UI } from './ui/ui.js';
 
 const CONFIG = (typeof window !== 'undefined' && window.TMSE_CONFIG) ? window.TMSE_CONFIG : {};
 const LOG = (...a)=> CONFIG.devLog && console.log('[TMSE]', ...a);
+const WARN = (...a)=> console.warn('[TMSE]', ...a);
 
 const version = 1;
 
@@ -48,16 +50,43 @@ function setBest(lessonId, activityTitle, score, stars) {
   if (score > prev.score || stars > prev.stars) {
     s[lessonId].activities[activityTitle] = {score, stars, at: Date.now()};
   }
+  // recompute lesson-level derived best on every activity save
+  const derived = recomputeLessonBestPercent(lessonId, s);
+  s[lessonId].lesson = {
+    score: derived.bestPercent,
+    stars: derived.stars,
+    at: Date.now()
+  };
   saveSaves(s);
 }
 function setBestLesson(lessonId, score, stars) {
+  // Keep for compatibility, but prefer derived recompute.
   const s = loadSaves();
   s[lessonId] = s[lessonId] || { activities:{}, lesson:{score:0, stars:0}};
-  const prev = s[lessonId].lesson || {score:0, stars:0};
-  if (score > prev.score || stars > prev.stars) {
-    s[lessonId].lesson = {score, stars, at: Date.now()};
-  }
+  s[lessonId].lesson = {score, stars, at: Date.now()};
   saveSaves(s);
+}
+
+// ---- NEW: Public saves helpers per spec ------------------------------------
+function getActivityBestPercent(lessonId, activityTitle) {
+  return getBest(lessonId, activityTitle).score || 0;
+}
+function getLessonBestPercent(lessonId) {
+  const s = loadSaves();
+  if (!s[lessonId]) return 0;
+  return s[lessonId].lesson?.score || 0;
+}
+function recomputeLessonBestPercent(lessonId, snapshot = null) {
+  const store = snapshot || loadSaves();
+  const lesson = state.lessons.get(lessonId);
+  if (!lesson) return { bestPercent: 0, stars: 0 };
+  const acts = lesson.activities || [];
+  if (acts.length === 0) return { bestPercent: 0, stars: 0 };
+  const percs = acts.map(a => (store[lessonId]?.activities?.[a.title]?.score) || 0);
+  const avg = Math.round(percs.reduce((s,v)=>s+v,0) / acts.length);
+  const thresholds = lesson.starThresholds || CONFIG.defaultStarThresholds;
+  const stars = percentToStars(avg, thresholds);
+  return { bestPercent: avg, stars };
 }
 
 // ---- Helpers ----------------------------------------------------------------
@@ -85,13 +114,16 @@ function percentToStars(pct, thresholds) {
   if (pct >= s3) stars = 3;
   return stars;
 }
+function debounce(fn, wait=150){
+  let t; return (...args)=>{ clearTimeout(t); t = setTimeout(()=>fn(...args), wait); };
+}
 
 // ---- Lesson & Game registries ----------------------------------------------
 const state = {
   lessons: new Map(),     // id -> lessonObj
   games: new Map(),       // id -> {id,title,init,destroy}
   screens: {},            // DOM refs
-  current: { lesson:null, activityIndex:0, playingAll:false, timerCtl:null },
+  current: { lesson:null, activityIndex:0, playingAll:false, timerCtl:null, delegatesCleanup:null },
 };
 
 function registerLesson(lessonObj) {
@@ -99,19 +131,23 @@ function registerLesson(lessonObj) {
     if (!lessonObj || !lessonObj.id || !lessonObj.name || !Array.isArray(lessonObj.activities)) {
       throw new Error('Invalid lesson schema: require id, name, activities[]');
     }
+    if (state.lessons.has(lessonObj.id)) {
+      LOG(`Duplicate lesson "${lessonObj.id}" ignored (already registered).`);
+      return; // guard against double-registration under rapid scans
+    }
     state.lessons.set(lessonObj.id, lessonObj);
     LOG('Lesson registered:', lessonObj.id);
     UI.toast(`Loaded lesson: ${lessonObj.name}`);
     refreshLessonSelect();
   } catch (e) {
-    console.warn('[TMSE] registerLesson error', e);
+    WARN('registerLesson error', e);
     UI.toast('Failed to register lesson (see console)', { danger:true });
   }
 }
 
 function registerGame(game) {
   if (!game || !game.id || typeof game.init !== 'function') {
-    console.warn('[TMSE] Bad game registration', game);
+    WARN('Bad game registration', game);
     return;
   }
   state.games.set(game.id, game);
@@ -130,14 +166,16 @@ async function scanManifest() {
     let loaded = 0;
     await Promise.all(list.map(fn=>{
       if (!allowed.test(fn)) {
-        console.warn('[TMSE] File ignored by pattern:', fn);
+        WARN('File ignored by pattern:', fn);
         return;
       }
-      return loadLessonScript(`${CONFIG.contentPath}${fn}`).then(()=>loaded++);
+      return loadLessonScriptWithTimeout(`${CONFIG.contentPath}${fn}`, CONFIG.importTimeoutMs || 5000)
+        .then(()=>loaded++)
+        .catch(e=> WARN('Lesson load failed from manifest', fn, e));
     }));
     UI.toast(`Manifest scan complete: ${loaded} lesson(s)`);
   } catch (e) {
-    console.warn('[TMSE] Manifest scan failed', e);
+    WARN('Manifest scan failed', e);
     UI.toast('Could not fetch manifest.json (see console)', { danger:true });
   }
 }
@@ -152,43 +190,61 @@ function loadLessonScript(src) {
     document.head.appendChild(s);
   });
 }
+function loadLessonScriptWithTimeout(src, timeoutMs=5000){
+  let timer;
+  return Promise.race([
+    loadLessonScript(src),
+    new Promise((_, rej)=> { timer = setTimeout(()=> rej(new Error('Import timeout')), timeoutMs); })
+  ]).finally(()=> clearTimeout(timer));
+}
 
-function loadLessonFromFile(file) {
+function loadLessonFromFile(file, hooks) {
   const allowed = new RegExp(CONFIG.allowedLessonPattern);
   if (!CONFIG.allowAnyUrl && !allowed.test(file.name)) {
     UI.toast('Filename rejected by pattern. Update tmse.config.js to allow.', {danger:true});
+    hooks?.error?.('Filename rejected by pattern.');
     return;
   }
   const reader = new FileReader();
   reader.onload = () => {
     const blob = new Blob([reader.result], {type:'text/javascript'});
     const url = URL.createObjectURL(blob);
-    loadLessonScript(url).then(()=>{
+    loadLessonScriptWithTimeout(url, CONFIG.importTimeoutMs || 5000).then(()=>{
       UI.toast('Lesson loaded from file.');
+      hooks?.success?.();
     }).catch(e=>{
-      console.warn(e);
-      UI.toast('Failed to execute lesson file (see console).', {danger:true});
+      WARN(e);
+      hooks?.error?.('Failed to execute lesson file.');
+      UI.toast('Failed to execute lesson file.', {danger:true});
     });
+  };
+  reader.onerror = ()=> {
+    hooks?.error?.('Could not read file.');
+    UI.toast('Could not read file.', {danger:true});
   };
   reader.readAsText(file);
 }
 
-function loadLessonFromUrl(urlStr) {
+function loadLessonFromUrl(urlStr, hooks) {
   try {
     const u = new URL(urlStr);
     const fname = u.pathname.split('/').pop();
     const allowed = new RegExp(CONFIG.allowedLessonPattern);
     if (!CONFIG.allowAnyUrl && !allowed.test(fname)) {
       UI.toast('Remote URL rejected by filename pattern.', {danger:true});
+      hooks?.error?.('URL rejected by filename pattern.');
       return;
     }
-    loadLessonScript(urlStr).then(()=>{
+    loadLessonScriptWithTimeout(urlStr, CONFIG.importTimeoutMs || 5000).then(()=>{
       UI.toast('Lesson loaded from URL.');
+      hooks?.success?.();
     }).catch(e=>{
-      console.warn(e);
-      UI.toast('Remote load failed (CORS or bad URL).', {danger:true});
+      WARN('Remote load failed', e);
+      hooks?.error?.('Remote load failed (CORS, 404, or timeout).');
+      UI.toast('Remote load failed (CORS/404/timeout).', {danger:true});
     });
   } catch {
+    hooks?.error?.('Invalid URL.');
     UI.toast('Invalid URL.', {danger:true});
   }
 }
@@ -196,6 +252,8 @@ function loadLessonFromUrl(urlStr) {
 // ---- Router -----------------------------------------------------------------
 const Screens = {
   to(name) {
+    // cleanup game delegates on any nav
+    if (state.current.delegatesCleanup) { state.current.delegatesCleanup(); state.current.delegatesCleanup = null; }
     document.querySelectorAll('[data-screen]').forEach(s=>s.classList.remove('active'));
     const el = document.getElementById(`screen-${name}`);
     if (el) el.classList.add('active');
@@ -218,17 +276,23 @@ function refreshFilters() {
   state.lessons.forEach(l=>{ subjects.add(l.subject||''); courses.add(l.course||''); authors.add(l.author||''); });
   function fill(sel, set){
     const el = document.getElementById(sel);
-    const cur = el.value;
-    el.innerHTML = `<option value=\"\">All ${sel.split('-')[1]||'Items'}</option>` + [...set].filter(Boolean).sort().map(v=>`<option>${v}</option>`).join('');
+    const cur = el?.value || '';
+    if (!el) return;
+    el.innerHTML = `<option value="">All ${sel.split('-')[1]||'Items'}</option>` + [...set].filter(Boolean).sort().map(v=>`<option>${v}</option>`).join('');
     if ([...el.options].some(o=>o.value===cur)) el.value = cur;
   }
   fill('filter-subject', subjects);
   fill('filter-course', courses);
   fill('filter-author', authors);
 }
+const debouncedRefresh = debounce(()=> {
+  refreshLessonSelect();
+}, 150);
+
 function refreshLessonSelect() {
   refreshFilters();
   const grid = document.getElementById('lesson-grid');
+  if (!grid) return;
   const q = (document.getElementById('search')?.value||'').toLowerCase();
   const fs = document.getElementById('filter-subject')?.value||'';
   const fc = document.getElementById('filter-course')?.value||'';
@@ -242,18 +306,19 @@ function refreshLessonSelect() {
     && (!fa || (l.author===fa)));
   list.sort((a,b)=> sort==='az' ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name));
 
-  grid.innerHTML = '';
+  const frag = document.createDocumentFragment();
   list.forEach(lesson=>{
     const card = document.createElement('article');
     card.className = 'card'; card.role='listitem';
+    card.dataset.key = lesson.id; // keyed for stability
 
     const icon = document.createElement('div'); icon.className='icon';
     if (lesson.icon && lesson.icon.type==='png' && lesson.icon.src) {
       const img = document.createElement('img'); img.src = lesson.icon.src; img.alt = `${lesson.name} icon`;
-      img.onerror = ()=>{ icon.innerHTML = `<div class=\"icon-fallback\">${(lesson.subject||'?').slice(0,2).toUpperCase()}</div>`; };
+      img.onerror = ()=>{ icon.innerHTML = `<div class="icon-fallback">${(lesson.subject||'?').slice(0,2).toUpperCase()}</div>`; };
       icon.appendChild(img);
     } else {
-      icon.innerHTML = `<div class=\"icon-fallback\">${(lesson.subject||'?').slice(0,2).toUpperCase()}</div>`;
+      icon.innerHTML = `<div class="icon-fallback">${(lesson.subject||'?').slice(0,2).toUpperCase()}</div>`;
     }
 
     const meta = document.createElement('div'); meta.className='meta';
@@ -262,19 +327,22 @@ function refreshLessonSelect() {
     sub.textContent = `${lesson.course || '—'} • ${lesson.author || '—'} • ${lesson.subject || '—'}`;
 
     const badges = document.createElement('div'); badges.className = 'badges';
-    const best = loadSaves()[lesson.id]?.lesson || {score:0, stars:0};
-    const b1 = document.createElement('span'); b1.className='badge'; b1.textContent = `Best: ${best.score||0}%`;
-    const b2 = document.createElement('span'); b2.className='badge'; b2.appendChild(starRow(best.stars));
+    const derived = recomputeLessonBestPercent(lesson.id); // compute from activity bests
+    const b1 = document.createElement('span'); b1.className='badge'; b1.textContent = `Best: ${derived.bestPercent}%`;
+    const b2 = document.createElement('span'); b2.className='badge'; b2.appendChild(starRow(derived.stars));
     badges.append(b1,b2);
 
     meta.append(h, sub, badges);
 
     const go = document.createElement('button'); go.className='btn small'; go.textContent='View';
-    go.addEventListener('click', ()=> openLessonDetail(lesson.id));
+    go.addEventListener('click', ()=> openLessonDetail(lesson.id), {passive:true});
 
     card.append(icon, meta, go);
-    grid.appendChild(card);
+    frag.appendChild(card);
   });
+
+  // single DOM write avoids flicker/duplication during rapid updates
+  grid.replaceChildren(frag);
 }
 
 // ---- Lesson Detail ----------------------------------------------------------
@@ -294,8 +362,10 @@ function openLessonDetail(lessonId) {
   } else icon.innerHTML='<div class="icon-fallback">IC</div>';
 
   const titleWrap = document.createElement('div');
-  titleWrap.innerHTML = `<h2 style=\"margin:0\">${lesson.name}</h2>
-  <div class=\"sub\">${lesson.course || '—'} • ${lesson.author || '—'} • ${lesson.subject || '—'}</div>`;
+  const derived = recomputeLessonBestPercent(lesson.id);
+  titleWrap.innerHTML = `<h2 style="margin:0">${lesson.name}</h2>
+  <div class="sub">${lesson.course || '—'} • ${lesson.author || '—'} • ${lesson.subject || '—'}</div>
+  <div class="sub">Lesson Best: <strong>${derived.bestPercent}%</strong></div>`;
 
   const headerBtns = document.createElement('div'); headerBtns.style.marginLeft='auto';
   const playAll = document.createElement('button'); playAll.className='btn primary'; playAll.textContent='Play All Activities';
@@ -341,6 +411,26 @@ function estimateLessonSeconds(lesson) {
   return (lesson.activities || []).reduce((sum,a)=> sum + clampTimer(a.timeLimitSec || 60), 0);
 }
 
+// ---- Event Delegation for game area ----------------------------------------
+function installGameDelegates(container){
+  // Make first-tap reliable across devices; avoid ghost handlers after transitions.
+  const onPointerUp = (ev)=>{
+    const target = ev.target.closest('[data-action], button, .btn');
+    if (!target || target.disabled) return;
+    // Prefer dataset action; also synthesize click to trigger existing handlers
+    if (target.dataset && target.dataset.action){
+      container.dispatchEvent(new CustomEvent('tmse:action', { detail:{ action: target.dataset.action, target }, bubbles:true }));
+    }
+    // Ensure activation on touch-only devices
+    if (typeof target.click === 'function') target.click();
+  };
+  container.addEventListener('pointerup', onPointerUp, { passive:true });
+  container.addEventListener('click', ()=>{}, { passive:true }); // keep simple click path enabled
+  return ()=> {
+    container.removeEventListener('pointerup', onPointerUp);
+  };
+}
+
 // ---- Gameplay flow ----------------------------------------------------------
 function startLesson(playAll=false) {
   state.current.activityIndex = 0;
@@ -368,7 +458,6 @@ function startActivity(index) {
     timerEl.textContent = fmtTime(tLeft);
   }, ()=>{
     UI.toast('Time up!');
-    // let game consume end naturally; most games finish by click; force?
   });
   state.current.timerCtl = timerCtl;
 
@@ -386,6 +475,10 @@ function startActivity(index) {
   container.innerHTML = '';
   Screens.to('game');
 
+  // install event delegation on game container; cleanup on next nav
+  if (state.current.delegatesCleanup) { state.current.delegatesCleanup(); }
+  state.current.delegatesCleanup = installGameDelegates(container);
+
   const game = state.games.get(activity.type);
   if (!game) {
     container.textContent = `Game type "${activity.type}" is not registered.`;
@@ -396,15 +489,15 @@ function startActivity(index) {
   const rngApi = { random: rng, shuffle, pickSubset };
   const onComplete = ({scorePercent, details})=>{
     timerCtl.stop();
-    // Highs
-    const stars = percentToStars(scorePercent, thresholds);
-    setBest(lesson.id, activity.title, Math.round(scorePercent), stars);
+    const pct = Math.round(scorePercent);
+    const stars = percentToStars(pct, thresholds);
+    setBest(lesson.id, activity.title, pct, stars); // this also recomputes lesson best
 
     // If playing all, go to next or aggregate
     if (state.current.playingAll) {
-      showResults(lesson, activity, scorePercent, stars, details, { next: true });
+      showResults(lesson, activity, pct, stars, details, { next: true });
     } else {
-      showResults(lesson, activity, scorePercent, stars, details);
+      showResults(lesson, activity, pct, stars, details);
     }
   };
 
@@ -416,7 +509,7 @@ function startActivity(index) {
       getTimeLeft: ()=> timerCtl.remaining()
     });
   } catch(e) {
-    console.warn('[TMSE] Game init failed', e);
+    WARN('Game init failed', e);
     UI.toast('Game failed to start (see console).', {danger:true});
   }
 }
@@ -434,14 +527,13 @@ function showResults(lesson, activity, scorePercent, stars, details, opts={}) {
 
   // summary
   const sum = document.getElementById('results-summary');
-  sum.innerHTML = `<div class=\"sub\">Best: ${getBest(lesson.id, activity.title).score}% • Thresholds: ${(activity.starThresholds||CONFIG.defaultStarThresholds).join('% / ')}%</div>`;
+  sum.innerHTML = `<div class="sub">Best: ${getBest(lesson.id, activity.title).score}% • Thresholds: ${(activity.starThresholds||CONFIG.defaultStarThresholds).join('% / ')}%</div>`;
 
   // review
   const review = document.getElementById('results-review');
   review.innerHTML = '';
-  (details?.items||[]).forEach((it, i)=>{
+  (details?.items||[]).forEach((it)=>{
     const row = document.createElement('div'); row.className='review-item';
-    // Different games may provide different item structures
     if (it.prompt) {
       const q = document.createElement('div'); q.className='q'; q.textContent = it.prompt;
       const a = document.createElement('div'); a.textContent = `Your answer: ${it.your != null ? it.your : '—'}`;
@@ -449,13 +541,13 @@ function showResults(lesson, activity, scorePercent, stars, details, opts={}) {
       row.append(q,a,c);
       if (it.explanation){ const ex = document.createElement('div'); ex.className='ex'; ex.textContent = it.explanation; row.append(ex); }
     } else if (it.type==='match') {
-      row.innerHTML = `<div class=\"q\">Match: ${it.left} → ${it.right}</div><div>${it.correct? '✓ Correct' : '✗ Wrong'}</div>`;
+      row.innerHTML = `<div class="q">Match: ${it.left} → ${it.right}</div><div>${it.correct? '✓ Correct' : '✗ Wrong'}</div>`;
     } else if (it.type==='sequence') {
-      row.innerHTML = `<div class=\"q\">Sequence</div><div class=\"ex\">Final order: ${it.finalOrder?.join(' › ')}</div>`;
+      row.innerHTML = `<div class="q">Sequence</div><div class="ex">Final order: ${it.finalOrder?.join(' › ')}</div>`;
     } else if (it.type==='memory') {
-      row.innerHTML = `<div class=\"q\">Memory</div><div class=\"ex\">Pairs matched: ${it.matched}/${it.totalPairs}</div>`;
+      row.innerHTML = `<div class="q">Memory</div><div class="ex">Pairs matched: ${it.matched}/${it.totalPairs}</div>`;
     } else if (it.type==='flashcard') {
-      row.innerHTML = `<div class=\"q\">Flashcards</div><div class=\"ex\">Got it: ${it.got}/${it.total}</div>`;
+      row.innerHTML = `<div class="q">Flashcards</div><div class="ex">Got it: ${it.got}/${it.total}</div>`;
     }
     review.append(row);
   });
@@ -464,32 +556,31 @@ function showResults(lesson, activity, scorePercent, stars, details, opts={}) {
   const replay = document.getElementById('btn-replay');
   const back = document.getElementById('btn-back-lesson');
   replay.onclick = ()=> startActivity(state.current.activityIndex);
-  back.onclick = ()=> Screens.to('lesson-detail');
+  back.onclick = ()=> {
+    // ensure derived lesson best shown after results
+    const derived = recomputeLessonBestPercent(lesson.id);
+    setBestLesson(lesson.id, derived.bestPercent, derived.stars);
+    Screens.to('lesson-detail');
+  };
 
   Screens.to('results');
 
   if (opts.next) {
-    // Seamless continue button overlay on results
+    const actionsHolder = document.querySelector('#screen-results .actions');
+    // clear any existing "Next/Finish" button from prior round
+    [...actionsHolder.querySelectorAll('.btn.auto-flow')].forEach(b=>b.remove());
     const idx = state.current.activityIndex;
     if (idx < (lesson.activities.length-1)) {
-      const btn = document.createElement('button'); btn.className='btn primary'; btn.textContent='Next Activity ▶';
+      const btn = document.createElement('button'); btn.className='btn primary auto-flow'; btn.textContent='Next Activity ▶';
       btn.onclick = ()=> startActivity(idx+1);
-      document.querySelector('#screen-results .actions').prepend(btn);
+      actionsHolder.prepend(btn);
     } else {
-      // Aggregate lesson score
-      const activitySaves = loadSaves()[lesson.id]?.activities || {};
-      const lessonScores = (lesson.activities||[]).map(a=> activitySaves[a.title]?.score || 0);
-      let agg = 0;
-      if ((lesson.scoring?.aggregate||'average') === 'sum') {
-        agg = lessonScores.reduce((s,v)=>s+v,0) / (lesson.activities.length || 1);
-      } else {
-        agg = lessonScores.reduce((s,v)=>s+v,0) / (lesson.activities.length || 1);
-      }
-      const lessonStars = percentToStars(agg, CONFIG.defaultStarThresholds);
-      setBestLesson(lesson.id, Math.round(agg), lessonStars);
-      const btn = document.createElement('button'); btn.className='btn'; btn.textContent='Finish Lesson';
+      // Aggregate derived lesson score per spec
+      const derived = recomputeLessonBestPercent(lesson.id);
+      setBestLesson(lesson.id, derived.bestPercent, derived.stars);
+      const btn = document.createElement('button'); btn.className='btn auto-flow'; btn.textContent='Finish Lesson';
       btn.onclick = ()=> openLessonDetail(lesson.id);
-      document.querySelector('#screen-results .actions').prepend(btn);
+      actionsHolder.prepend(btn);
     }
   }
 }
@@ -500,7 +591,7 @@ function renderSettings() {
   panel.innerHTML = '';
   const makeToggle = (key,label)=> {
     const row = document.createElement('div'); row.className='activity-item';
-    const info = document.createElement('div'); info.className='info'; info.innerHTML = `<div class=\"name\">${label}</div><div class=\"hint\">${key}</div>`;
+    const info = document.createElement('div'); info.className='info'; info.innerHTML = `<div class="name">${label}</div><div class="hint">${key}</div>`;
     const btn = document.createElement('button'); btn.className='btn small'; btn.textContent = String(CONFIG[key]);
     btn.onclick = ()=> {
       CONFIG[key] = !CONFIG[key];
@@ -522,7 +613,7 @@ function renderSettings() {
 function initDom() {
   state.screens.start = document.getElementById('screen-start');
   document.querySelectorAll('.nav-btn').forEach(b=>{
-    b.addEventListener('click', ()=> Screens.to(b.dataset.nav));
+    b.addEventListener('click', ()=> Screens.to(b.dataset.nav), {passive:true});
   });
   document.getElementById('btn-scan')?.addEventListener('click', ()=> CONFIG.useManifest ? scanManifest() : UI.toast('Manifest disabled.'));
   document.getElementById('btn-scan-2')?.addEventListener('click', ()=> CONFIG.useManifest ? scanManifest() : UI.toast('Manifest disabled.'));
@@ -532,43 +623,58 @@ function initDom() {
     localStorage.removeItem(SAVE_KEY); UI.toast('All saves cleared.');
     refreshLessonSelect(); if (state.current.lesson) openLessonDetail(state.current.lesson.id);
   });
-  // Filters live update
+  // Debounced filters
   ['search','filter-subject','filter-course','filter-author','sort-alpha'].forEach(id=>{
-    document.getElementById(id)?.addEventListener('input', refreshLessonSelect);
+    document.getElementById(id)?.addEventListener('input', debouncedRefresh, {passive:true});
   });
   renderSettings();
 }
 
 function openLoadModal() {
-  UI.modal(({close})=>{
+  const lastFocus = document.activeElement;
+  const modal = UI.modal(({close, boxEl})=>{
     const box = document.createElement('div');
     box.innerHTML = `
-      <h3>Load Lesson</h3>
-      <div class=\"row\">
-        <label class=\"btn\">
-          <input id=\"file-in\" type=\"file\" accept=\".js\" hidden>
+      <div class="modal-header">
+        <h3 style="margin:0">Load Lesson</h3>
+        <button class="btn small ghost" data-close title="Close">✕</button>
+      </div>
+      <div class="row">
+        <label class="btn">
+          <input id="file-in" type="file" accept=".js" hidden>
           Choose .js file
         </label>
-        <div class=\"sub\">Filenames should match pattern in config.</div>
+        <div class="sub">Filenames should match pattern in config.</div>
       </div>
-      <div class=\"row\">
-        <input id=\"url-in\" class=\"input\" type=\"url\" placeholder=\"https://example.com/TMSE-something-001.js\" style=\"flex:1\">
-        <button id=\"btn-load-url\" class=\"btn\">Load URL</button>
+      <div class="row">
+        <input id="url-in" class="input" type="url" placeholder="https://example.com/TMSE-something-001.js" style="flex:1">
+        <button id="btn-load-url" class="btn">Load URL</button>
       </div>
-      <div class=\"row\">
-        <button class=\"btn ghost\" id=\"btn-close\">Close</button>
+      <div id="import-error" class="toast" role="alert" style="display:none"></div>
+      <div class="row">
+        <button class="btn ghost" data-close>Cancel</button>
       </div>
     `;
-    // hook
+    const err = box.querySelector('#import-error');
+    const showErr = (msg)=> { err.textContent = msg; err.style.display='block'; };
+
+    // hooks passed to loaders
+    const hooks = {
+      success: ()=> {},
+      error: (m)=> showErr(m || 'Import failed')
+    };
+
     box.querySelector('#file-in').addEventListener('change', (e)=>{
-      const f = e.target.files?.[0]; if (f) loadLessonFromFile(f);
-    });
+      const f = e.target.files?.[0]; if (f) loadLessonFromFile(f, hooks);
+    }, {passive:true});
     box.querySelector('#btn-load-url').addEventListener('click', ()=>{
-      const u = box.querySelector('#url-in').value.trim(); if (u) loadLessonFromUrl(u);
-    });
-    box.querySelector('#btn-close').addEventListener('click', close);
+      const u = box.querySelector('#url-in').value.trim(); if (u) loadLessonFromUrl(u, hooks);
+    }, {passive:true});
+    // bind close buttons
+    box.querySelectorAll('[data-close]').forEach(btn=> btn.addEventListener('click', ()=> { close(); (lastFocus?.focus?.()) }, {passive:true}));
     return box;
   });
+  // Close on ESC/click-outside handled inside UI.modal
 }
 
 // ---- Public API -------------------------------------------------------------
@@ -578,7 +684,12 @@ const TMSE = {
   rng: { random:rng, shuffle, pickSubset },
   registerLesson,
   registerGame,
-  navigate: { to: (screen, payload)=> Screens.to(screen) },
+  navigate: { to: (screen)=> Screens.to(screen) },
+  // NEW: saves helpers
+  saves: {
+    getActivityBestPercent,
+    getLessonBestPercent
+  }
 };
 
 if (typeof window !== 'undefined') window.TMSE = TMSE;
@@ -587,6 +698,5 @@ export default TMSE;
 // ---- Boot -------------------------------------------------------------------
 window.addEventListener('DOMContentLoaded', ()=>{
   initDom();
-  // Optional: auto-scan manifest on first load
   if (CONFIG.useManifest) scanManifest();
 });

@@ -2,6 +2,8 @@
 
 # Teach Me Stuff Engine (TMSE)
 
+https://spindash23.github.io/tmse/
+
 TMSE is a lightweight, colorful learning engine built with plain HTML/CSS/JS
 (no frameworks). It ships with five minigames (trivia, match, sequence,
 memory, flashcard), a modular lesson format, persistent stars/high scores, and

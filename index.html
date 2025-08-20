@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- TMSE (Teach Me Stuff Engine)
+    Dev Tips (edit safely):
+    - See /tmse.config.js for DEV FLAGS (paths, filename pattern, timers, randomness, etc.)
+    - Toggle seeded randomness, time caps, and manifest usage there.
+    - This project is plain HTML/CSS/JS. No build tools, no frameworks.
+    - Works on any static host (e.g., GitHub Pages). Serve the folder root.
+    - Keyboard is not required; all interactions are mouse/touch friendly.
+  -->
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Teach Me Stuff Engine (TMSE)</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:," />
+</head>
+<body>
+  <header class="tmse-topbar" role="banner">
+    <div class="brand" aria-label="TMSE brand">
+      <span class="logo-dot" aria-hidden="true"></span>
+      <strong>TMSE</strong>
+      <em class="tag">Teach Me Stuff Engine</em>
+    </div>
+    <nav class="topnav" aria-label="Primary">
+      <button class="nav-btn" data-nav="start" aria-label="Go to Start">Start</button>
+      <button class="nav-btn" data-nav="lessons" aria-label="Go to Lesson Select">Lesson Select</button>
+      <button class="nav-btn" data-nav="settings" aria-label="Open Settings">Settings</button>
+    </nav>
+  </header>
+
+  <main id="app" class="app-root" aria-live="polite">
+    <!-- START SCREEN -->
+    <section id="screen-start" class="screen active" data-screen>
+      <div class="hero">
+        <h1>Teach Me Stuff Engine</h1>
+        <p class="subtitle">Lightweight, colorful learning minigames — mouse/touch only.</p>
+      </div>
+      <div class="actions">
+        <button id="btn-scan" class="btn primary" aria-label="Scan for lessons">Scan Lessons</button>
+        <button id="btn-load" class="btn" aria-label="Load a lesson from file or URL">Load Lesson (File / URL)</button>
+        <button class="btn ghost" data-nav="lessons" aria-label="Go to Lesson Select">Go to Lesson Select</button>
+      </div>
+      <div class="quick-info">
+        <p>Lessons are JS files under <code>/content/</code>. Default example included. High scores &amp; stars persist in your browser.</p>
+      </div>
+    </section>
+
+    <!-- LESSON SELECT -->
+    <section id="screen-lessons" class="screen" data-screen>
+      <header class="section-header">
+        <h2>Lesson Select</h2>
+        <div class="filters" role="region" aria-label="Filters and search">
+          <input id="search" class="input" type="search" placeholder="Search by name…" aria-label="Search lessons" />
+          <select id="filter-subject" class="input" aria-label="Filter by subject">
+            <option value="">All Subjects</option>
+          </select>
+          <select id="filter-course" class="input" aria-label="Filter by course">
+            <option value="">All Courses</option>
+          </select>
+          <select id="filter-author" class="input" aria-label="Filter by author">
+            <option value="">All Authors</option>
+          </select>
+          <select id="sort-alpha" class="input" aria-label="Sort lessons">
+            <option value="az">A → Z</option>
+            <option value="za">Z → A</option>
+          </select>
+        </div>
+      </header>
+      <div id="lesson-grid" class="card-grid" role="list" aria-label="Lesson list"></div>
+      <div class="actions row">
+        <button id="btn-scan-2" class="btn" aria-label="Re-scan lessons">Re-scan Lessons</button>
+        <button id="btn-load-2" class="btn" aria-label="Load a lesson from file or URL">Load Lesson</button>
+      </div>
+    </section>
+
+    <!-- LESSON DETAIL -->
+    <section id="screen-lesson-detail" class="screen" data-screen>
+      <button class="btn small ghost" data-nav="lessons">← Back to Lesson Select</button>
+      <div id="lesson-detail" class="lesson-detail" role="region" aria-label="Lesson details">
+        <!-- populated by JS -->
+      </div>
+    </section>
+
+    <!-- GAME SCREEN -->
+    <section id="screen-game" class="screen" data-screen aria-label="Gameplay">
+      <div class="hud" role="region" aria-label="In-game HUD">
+        <div class="hud-left">
+          <button id="btn-pause" class="btn small" aria-label="Pause">⏸ Pause</button>
+        </div>
+        <div class="hud-center">
+          <div id="hud-title" class="hud-title">Activity</div>
+          <div class="hud-subtitle" id="hud-subtitle"></div>
+        </div>
+        <div class="hud-right">
+          <div id="hud-timer" class="timer" aria-label="Countdown timer">00:00</div>
+          <div id="hud-progress" class="progress" aria-label="Progress bar"></div>
+        </div>
+      </div>
+      <div id="game-area" class="game-area" role="region" aria-label="Game area"></div>
+      <div id="pause-overlay" class="overlay hidden" aria-hidden="true">
+        <div class="overlay-card">
+          <h3>Paused</h3>
+          <button id="btn-resume" class="btn primary">Resume</button>
+          <button id="btn-quit" class="btn ghost">Quit Activity</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- RESULTS SCREEN -->
+    <section id="screen-results" class="screen" data-screen>
+      <div class="results-card" role="region" aria-label="Results">
+        <h2 id="results-title">Results</h2>
+        <div id="results-stars" class="stars"></div>
+        <div class="big-score"><span id="results-score">0</span>%</div>
+        <div id="results-summary"></div>
+        <div id="results-review" class="review"></div>
+        <div class="actions">
+          <button id="btn-replay" class="btn">Replay</button>
+          <button id="btn-back-lesson" class="btn ghost">Back to Lesson</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="screen-settings" class="screen" data-screen>
+      <h2>Settings</h2>
+      <div id="settings-panel" class="settings-panel" role="form" aria-label="Settings form">
+        <!-- populated from config by JS -->
+      </div>
+      <div class="actions">
+        <button id="btn-clear-saves" class="btn danger">Clear All Saves</button>
+      </div>
+    </section>
+  </main>
+
+  <!-- UI Root (toasts, modals) -->
+  <div id="ui-root" class="ui-root" aria-live="polite"></div>
+
+  <!-- Order matters: config → core → games (register) → start-up -->
+  <script src="tmse.config.js"></script>
+  <script type="module" src="tmse.js"></script>
+  <script type="module" src="ui/ui.js"></script>
+  <script type="module" src="games/trivia.js"></script>
+  <script type="module" src="games/match.js"></script>
+  <script type="module" src="games/sequence.js"></script>
+  <script type="module" src="games/memory.js"></script>
+  <script type="module" src="games/flashcard.js"></script>
+</body>
+</html>
